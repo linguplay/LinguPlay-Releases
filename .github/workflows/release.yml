@@ -53,6 +53,11 @@ env:
   VITE_SUPABASE_ANON_KEY: ${{ vars.VITE_SUPABASE_ANON_KEY }}
   VITE_PUBLIC_SITE_URL: ${{ vars.VITE_PUBLIC_SITE_URL }}
   VITE_PAYMENT_GATEWAY: ${{ vars.VITE_PAYMENT_GATEWAY }}
+  # Read at BUILD time and baked into the bundle. Absent here means
+  # IRR_PER_EUR = 0, which makes rialConfigured() false and closes checkout for
+  # Iranian buyers — silently, in a build that otherwise looks fine. v0.3.1
+  # shipped exactly that. The guard in `quality` now catches the omission.
+  VITE_IRR_PER_EUR: ${{ vars.VITE_IRR_PER_EUR }}
 
 jobs:
   # ------------------------------------------------------------ quality
@@ -107,6 +112,37 @@ jobs:
           fi
 
       - uses: actions/checkout@v5
+
+      # Every VITE_* repository variable must also appear in this workflow's
+      # env block, or Vite cannot inline it and the setting is silently absent
+      # from the shipped bundle. Adding the variable and forgetting the env
+      # line produces a green build with a broken feature, which is the worst
+      # kind of failure — so compare the two lists and fail loudly.
+      - name: Every VITE_* variable reaches the build
+        env:
+          ALL_VARS: ${{ toJSON(vars) }}
+        run: |
+          set -euo pipefail
+          missing=$(python3 - <<'PY'
+          import json, os
+          declared = json.loads(os.environ["ALL_VARS"])
+          gaps = []
+          for name, value in declared.items():
+              if not name.startswith("VITE_"):
+                  continue
+              if value in (None, ""):
+                  continue
+              if os.environ.get(name, "") != value:
+                  gaps.append(name)
+          print(" ".join(sorted(gaps)))
+          PY
+          )
+          if [ -n "$missing" ]; then
+            echo "::error::These repository variables never reach the build — add them to the workflow's env block: $missing"
+            exit 1
+          fi
+          echo "All VITE_* repository variables are passed through to the build."
+
       - uses: ./.github/actions/setup-source
         with:
           source-ref: ${{ inputs.source_ref }}
