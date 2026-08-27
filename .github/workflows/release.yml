@@ -1,0 +1,504 @@
+# =====================================================================
+#  THE LinguPlay RELEASE PIPELINE — the only one.
+#
+#  Every public installer LinguPlay ships is produced here, in the PUBLIC
+#  repository, because GitHub bills Actions minutes to the repository that
+#  runs the job and public repositories run standard runners for free.
+#  The application source stays private: each job checks it out at build
+#  time with a read-only deploy key and never commits it here.
+#
+#  Do not add build workflows to linguplay/Linguplay — its Actions are
+#  billing-blocked and anything added there will fail before it starts.
+#  See PIPELINE.md in this repository for the full picture.
+# =====================================================================
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version WITHOUT a leading v (e.g. 0.3.0)
+        required: true
+        type: string
+      source_ref:
+        description: Private source branch, tag, or commit to build
+        required: true
+        default: main
+        type: string
+      prerelease:
+        description: Mark this release as a prerelease
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linguplay-release
+  cancel-in-progress: false
+
+env:
+  VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+  VITE_SUPABASE_ANON_KEY: ${{ vars.VITE_SUPABASE_ANON_KEY }}
+  VITE_PUBLIC_SITE_URL: ${{ vars.VITE_PUBLIC_SITE_URL }}
+  VITE_PAYMENT_GATEWAY: ${{ vars.VITE_PAYMENT_GATEWAY }}
+
+jobs:
+  # ------------------------------------------------------------ quality
+  # Typecheck, lint and tests run ONCE here rather than in every platform
+  # job. A broken commit fails in ~2 minutes instead of after six parallel
+  # platform builds have each spent their own time discovering it.
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Version must be semantic and carry no leading v (got '$RELEASE_VERSION')."
+            exit 1
+          fi
+
+      - name: Refuse to overwrite an existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists. Bump the version — re-publishing a tag would silently change what existing download links serve."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-source
+        with:
+          source-ref: ${{ inputs.source_ref }}
+          version: ${{ inputs.version }}
+          deploy-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - name: Quality gate
+        working-directory: source
+        run: npm run typecheck && npm run lint && npm test
+
+  # -------------------------------------------------------------- macOS
+  # arm64 .app with libVLC copied INSIDE the bundle, so users need no VLC
+  # install. install_name_tool rewriting invalidates the signature, hence
+  # the ad-hoc re-sign before the DMG is created.
+  macos:
+    needs: quality
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install VLC (source of the bundled libVLC)
+        run: brew install --cask vlc
+
+      - uses: ./.github/actions/setup-source
+        with:
+          source-ref: ${{ inputs.source_ref }}
+          version: ${{ inputs.version }}
+          deploy-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source/src-tauri -> target
+
+      - name: Build application
+        working-directory: source
+        run: npm run tauri build -- --features nativeplayer --bundles app
+
+      - name: Bundle libVLC and create DMG
+        working-directory: source
+        run: |
+          set -euo pipefail
+          APP="src-tauri/target/release/bundle/macos/LinguPlay.app"
+          VLCMAC="/Applications/VLC.app/Contents/MacOS"
+          BIN="$APP/Contents/MacOS/LinguPlay"
+
+          mkdir -p "$APP/Contents/MacOS/lib" "$APP/Contents/MacOS/plugins"
+          cp -R "$VLCMAC/lib/." "$APP/Contents/MacOS/lib/"
+          cp -R "$VLCMAC/plugins/." "$APP/Contents/MacOS/plugins/"
+
+          old_reference=$(otool -L "$BIN" | awk '/libvlc\.dylib/ { print $1; exit }')
+          if [ -n "${old_reference:-}" ]; then
+            install_name_tool -change "$old_reference" @rpath/libvlc.dylib "$BIN"
+          fi
+
+          codesign --force --deep --sign - "$APP"
+          mkdir -p out
+          hdiutil create -volname "LinguPlay" -srcfolder "$APP" \
+            -ov -format UDZO "out/LinguPlay_native_arm64.dmg"
+          shasum -a 256 "out/LinguPlay_native_arm64.dmg" > "out/LinguPlay_native_arm64.dmg.sha256"
+          hdiutil verify "out/LinguPlay_native_arm64.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-macos
+          path: source/out/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------- Windows + Linux
+  desktop:
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+          - platform: windows-latest
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libvlc-dev
+
+      - uses: ./.github/actions/setup-source
+        with:
+          source-ref: ${{ inputs.source_ref }}
+          version: ${{ inputs.version }}
+          deploy-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source/src-tauri -> target
+
+      # Windows ships libVLC beside the exe so users need no VLC install.
+      # Checksum-verified: a tampered or truncated download fails the build.
+      - name: Download and bundle VLC (Windows only)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          VLC_VERSION="3.0.21"
+          VLC_ARCHIVE="vlc-${VLC_VERSION}-win64.zip"
+          VLC_SHA256="a0b7ec02b50adf6417eed014fb8df50af39690505a4225b85b3dc2ed17d14843"
+          mkdir -p src-tauri/vlc
+          curl --fail --location --retry 5 --retry-delay 2 --retry-all-errors \
+            --connect-timeout 30 \
+            "https://download.videolan.org/pub/videolan/vlc/${VLC_VERSION}/win64/${VLC_ARCHIVE}" \
+            -o "${VLC_ARCHIVE}"
+          echo "${VLC_SHA256}  ${VLC_ARCHIVE}" | sha256sum --check -
+          unzip -q "${VLC_ARCHIVE}"
+          cp "vlc-${VLC_VERSION}/libvlc.dll" src-tauri/vlc/
+          cp "vlc-${VLC_VERSION}/libvlccore.dll" src-tauri/vlc/
+          cp -r "vlc-${VLC_VERSION}/plugins" src-tauri/vlc/
+          rm -rf "${VLC_ARCHIVE}" "vlc-${VLC_VERSION}"
+
+      - name: Build app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: source
+
+      # libvlc.dll is a LOAD-TIME import (raw-dylib), so Windows must find it
+      # in the executable's own directory — it never searches subfolders.
+      # Extract the built MSI and prove the layout rather than trusting the
+      # config, so this cannot regress silently.
+      - name: Verify libvlc.dll ships beside the executable (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem -Path source/src-tauri/target -Recurse -Filter *.msi | Select-Object -First 1
+          if (-not $msi) { throw "No .msi produced, cannot verify DLL layout" }
+          $dest = Join-Path $env:RUNNER_TEMP "msi-extract"
+          Start-Process msiexec -ArgumentList @("/a", "`"$($msi.FullName)`"", "/qn", "TARGETDIR=`"$dest`"") -Wait
+          $exe = Get-ChildItem -Path $dest -Recurse -Filter "*.exe" |
+                 Where-Object { $_.BaseName -match 'inguplay' } | Select-Object -First 1
+          if (-not $exe) { throw "Could not find the app executable inside the MSI" }
+          $dll = Get-ChildItem -Path $dest -Recurse -Filter "libvlc.dll" | Select-Object -First 1
+          if (-not $dll) { throw "libvlc.dll is not present in the installer at all" }
+          if ($dll.DirectoryName -ne $exe.DirectoryName) {
+            throw "libvlc.dll is at $($dll.DirectoryName) but must sit beside the exe at $($exe.DirectoryName) — the app will fail to launch."
+          }
+          $core = Get-ChildItem -Path $exe.DirectoryName -Filter "libvlccore.dll"
+          if (-not $core) { throw "libvlccore.dll is missing from the executable directory" }
+          Write-Host "OK: libvlc.dll and libvlccore.dll sit beside the executable."
+
+      - name: Collect installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find source/src-tauri/target -path '*/release/bundle/*' \
+            \( -name '*.deb' -o -name '*.AppImage' -o -name '*.msi' \
+               -o -name '*-setup.exe' \) \
+            -exec cp {} out/ \;
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.platform }}
+          path: out/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------ Android
+  android:
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      # A release must never produce an unsigned or throwaway-signed build:
+      # Android refuses to install an update signed with a different key,
+      # which would strand every existing user on their current version.
+      - name: Check signing secrets
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE" ] || [ -z "$STORE_PASS" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASS" ]; then
+            echo "::error::All four ANDROID_KEYSTORE_* secrets must be set on THIS repository. See PIPELINE.md."
+            exit 1
+          fi
+
+      - uses: ./.github/actions/setup-source
+        with:
+          source-ref: ${{ inputs.source_ref }}
+          version: ${{ inputs.version }}
+          deploy-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: sdkmanager "ndk;26.1.10909125" "platform-tools"
+
+      - name: Install Rust + Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source/src-tauri -> target
+
+      - name: Initialize Android project
+        working-directory: source
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        run: |
+          if [ ! -d src-tauri/gen/android ]; then
+            npm run tauri android init -- --ci
+          fi
+
+      # `tauri android init` emits Tauri's placeholder launcher resources;
+      # this copies LinguPlay's icons/launch theme over them and verifies the
+      # result by checksum, so a silent regression fails the build.
+      - name: Apply LinguPlay Android resources
+        working-directory: source
+        run: npm run android:sync-resources
+
+      - name: Decode keystore
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/upload.jks"
+
+      - name: Build AAB (release)
+        working-directory: source
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        run: npm run tauri android build -- --aab
+
+      - name: Build APK (release, arm64)
+        working-directory: source
+        env:
+          NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
+        run: npm run tauri android build -- --apk --target aarch64
+
+      - name: Sign AAB and APK with the upload key
+        working-directory: source
+        env:
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          GEN=$(find src-tauri/gen/android -path '*/app/build/outputs' -type d -print -quit)
+          if [ -z "$GEN" ]; then
+            echo "::error::Android build output directory was not found"
+            exit 1
+          fi
+          mkdir -p out
+
+          AAB=$(find "$GEN/bundle" -name '*-release.aab' | head -1)
+          if [ -z "$AAB" ]; then
+            echo "::error::Release AAB was not produced"
+            exit 1
+          fi
+          jarsigner -keystore "$RUNNER_TEMP/upload.jks" \
+            -storepass "$KS_PASS" -keypass "$KEY_PASS" \
+            -sigalg SHA256withRSA -digestalg SHA-256 \
+            "$AAB" "$KEY_ALIAS"
+          cp "$AAB" "out/LinguPlay_${RELEASE_VERSION}.aab"
+
+          UNSIGNED_APK=$(find "$GEN/apk" -name '*-release-unsigned.apk' | head -1)
+          if [ -z "$UNSIGNED_APK" ]; then
+            echo "::error::Unsigned release APK was not produced"
+            exit 1
+          fi
+          "$BT/zipalign" -f 4 "$UNSIGNED_APK" out/aligned.apk
+          "$BT/apksigner" sign --ks "$RUNNER_TEMP/upload.jks" \
+            --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --out "out/LinguPlay_${RELEASE_VERSION}_arm64.apk" out/aligned.apk
+          rm -f out/aligned.apk
+
+          # Prove the APK really carries the upload key before anyone ships it.
+          "$BT/apksigner" verify --print-certs "out/LinguPlay_${RELEASE_VERSION}_arm64.apk" | head -5
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-android
+          path: source/out/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------- Chrome extension
+  extension:
+    needs: quality
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-source
+        with:
+          source-ref: ${{ inputs.source_ref }}
+          version: ${{ inputs.version }}
+          deploy-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - name: Build extension
+        working-directory: source/extension
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run lint
+          npm run build
+          mkdir -p ../out
+          cd dist && zip -r "../../out/LinguPlay_Extension_${RELEASE_VERSION}.zip" .
+          ls -la ../../out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-extension
+          path: source/out/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- iOS
+  # Validation only. An installable .ipa needs a paid Apple Developer
+  # account and signing certificates, which LinguPlay does not have yet —
+  # see PIPELINE.md, "Turning on iOS". This job compiles the app for the
+  # simulator to prove the Rust/Swift/WebView integration still builds, and
+  # deliberately does NOT gate the release: a platform that ships nothing
+  # must not be able to block the platforms that do.
+  ios:
+    needs: quality
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup-source
+        with:
+          source-ref: ${{ inputs.source_ref }}
+          version: ${{ inputs.version }}
+          deploy-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - name: Install Rust + iOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source/src-tauri -> target
+
+      - name: Initialize generated iOS project
+        working-directory: source
+        run: npm run tauri ios init -- --ci
+
+      - name: Build iOS simulator app (no signing)
+        working-directory: source
+        run: npm run tauri ios build -- --target aarch64-sim --no-sign --ci
+
+  # ------------------------------------------------------------ publish
+  # One release, created only after every SHIPPING platform succeeded, and
+  # published immediately rather than drafted-and-flipped so that the
+  # website's releases/latest never sees a half-populated release.
+  publish:
+    needs: [macos, desktop, android, extension]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all installers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: installers-*
+          merge-multiple: true
+          path: dist
+
+      - name: Show what will be published
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          test -n "$(ls -A dist)" || { echo "::error::No artifacts to publish"; exit 1; }
+
+      - name: Publish public release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: v${{ inputs.version }}
+          name: LinguPlay v${{ inputs.version }}
+          draft: false
+          prerelease: ${{ inputs.prerelease }}
+          make_latest: ${{ inputs.prerelease == false }}
+          files: dist/*
+          body: |
+            Official LinguPlay installers.
+
+            | Platform | Download |
+            |---|---|
+            | macOS (Apple Silicon) | `LinguPlay_native_arm64.dmg` |
+            | Windows | `.msi` |
+            | Linux | `.deb` / `.AppImage` |
+            | Android | `LinguPlay_${{ inputs.version }}_arm64.apk` |
+            | Chrome / Edge extension | `LinguPlay_Extension_${{ inputs.version }}.zip` |
+
+            The macOS build is ad-hoc signed but not yet notarized by Apple, so
+            the first launch may need a Control-click and **Open**.
+
+            Built from private source `${{ inputs.source_ref }}`.
