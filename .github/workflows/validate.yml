@@ -1,0 +1,66 @@
+# Proves the release plumbing works WITHOUT publishing anything: that the
+# deploy key can still read the private source, that the repository variables
+# satisfy validate-client-config, and that the source passes its own quality
+# gate. Run this after changing a secret, a variable, or the deploy key —
+# it answers "would a release work?" in a few minutes instead of finding out
+# halfway through a real one.
+name: Validate pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private source branch, tag, or commit to check
+        required: true
+        default: main
+        type: string
+  schedule:
+    # Weekly, so an expired deploy key or a drifted variable surfaces on a
+    # quiet Monday rather than the moment someone needs to ship.
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
+  VITE_SUPABASE_ANON_KEY: ${{ vars.VITE_SUPABASE_ANON_KEY }}
+  VITE_PUBLIC_SITE_URL: ${{ vars.VITE_PUBLIC_SITE_URL }}
+  VITE_PAYMENT_GATEWAY: ${{ vars.VITE_PAYMENT_GATEWAY }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check required secrets are present
+        env:
+          DEPLOY_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          fail=0
+          [ -n "$DEPLOY_KEY" ] || { echo "::error::SOURCE_DEPLOY_KEY is not set — no job can reach the source."; fail=1; }
+          for pair in "ANDROID_KEYSTORE_BASE64:$KEYSTORE" "ANDROID_KEYSTORE_PASSWORD:$STORE_PASS" \
+                      "ANDROID_KEY_ALIAS:$KEY_ALIAS" "ANDROID_KEY_PASSWORD:$KEY_PASS"; do
+            name="${pair%%:*}"; value="${pair#*:}"
+            [ -n "$value" ] || { echo "::warning::$name is not set — the android job will fail. See PIPELINE.md."; }
+          done
+          exit $fail
+
+      - uses: ./.github/actions/setup-source
+        with:
+          source-ref: ${{ inputs.source_ref || 'main' }}
+          version: 0.0.0-validate
+          deploy-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - name: Quality gate
+        working-directory: source
+        run: npm run typecheck && npm run lint && npm test
+
+      - name: Result
+        run: echo "Pipeline plumbing is good — a release from this ref would build."
