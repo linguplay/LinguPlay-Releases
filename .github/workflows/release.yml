@@ -426,9 +426,12 @@ jobs:
           fi
           APK="out/LinguPlay_${RELEASE_VERSION}${SUFFIX}_arm64.apk"
           "$BT/zipalign" -f 4 "$UNSIGNED_APK" out/aligned.apk
+          # v4 signing emits a separate .idsig that only `adb install
+          # --incremental` consumes. Publishing it just puts a file nobody
+          # needs next to the download.
           "$BT/apksigner" sign --ks "$RUNNER_TEMP/upload.jks" \
             --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" \
-            --ks-key-alias "$KEY_ALIAS" \
+            --ks-key-alias "$KEY_ALIAS" --v4-signing-enabled false \
             --out "$APK" out/aligned.apk
           rm -f out/aligned.apk
 
