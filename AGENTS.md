@@ -56,7 +56,12 @@ These all look reasonable and all waste time:
   Renaming breaks every download button. See PIPELINE.md, "Asset names are
   load-bearing".
 - **"iOS just needs the workflow finished."** It needs a paid Apple Developer
-  account and signing certificates. No workflow edit substitutes for that.
+  account and signing certificates. No workflow edit substitutes for that. The
+  `ios-simulator-app` artifact runs on a Mac under Xcode, not on a phone.
+- **"I'll run a preview build and give people the APK."** A preview APK is
+  signed with a throwaway key. Whoever installs it must uninstall before they
+  can ever take a Play-signed update. Previews are for trying the app, not for
+  distributing it.
 - **"I'll re-run the release to fix an asset."** Publishing over an existing tag
   changes what a public, already-shared download URL serves. Bump the version.
   The workflow blocks this on purpose.

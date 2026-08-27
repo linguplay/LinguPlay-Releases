@@ -25,8 +25,18 @@ on:
         required: true
         default: main
         type: string
+      channel:
+        description: >
+          release = signed, public, becomes "latest".
+          preview  = no production secrets needed; builds Android with a
+          throwaway key and an iOS simulator app. Always a prerelease, so the
+          website's releases/latest never picks it up.
+        required: true
+        default: preview
+        type: choice
+        options: [preview, release]
       prerelease:
-        description: Mark this release as a prerelease
+        description: Mark a release-channel build as a prerelease too
         required: false
         default: false
         type: boolean
@@ -62,10 +72,33 @@ jobs:
             exit 1
           fi
 
+      - name: Check the channel's requirements are met
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANNEL" = "release" ]; then
+            if [ -z "$KEYSTORE" ] || [ -z "$STORE_PASS" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASS" ]; then
+              echo "::error::The release channel needs all four ANDROID_KEYSTORE_* secrets. Use channel=preview until they are set. See PIPELINE.md."
+              exit 1
+            fi
+            echo "release channel: Android will be signed with the real upload key."
+          else
+            echo "::warning::PREVIEW build — Android is signed with a throwaway key and CANNOT be upgraded in place by a Play-signed build later. Not for public distribution."
+          fi
+
+      # A preview must never occupy the tag the real release will want, so it
+      # gets its own suffixed tag. The run number keeps repeat previews of one
+      # version from colliding with each other.
       - name: Refuse to overwrite an existing release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: v${{ inputs.version }}
+        if: inputs.channel == 'release'
         run: |
           set -euo pipefail
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -261,19 +294,37 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # A release must never produce an unsigned or throwaway-signed build:
-      # Android refuses to install an update signed with a different key,
-      # which would strand every existing user on their current version.
-      - name: Check signing secrets
+      # There is no such thing as an installable unsigned APK — Android
+      # refuses to install one at all. So a preview build is signed with a
+      # throwaway key generated here, which is installable by sideload but can
+      # NEVER be updated in place by a Play-signed build. A release build must
+      # use the real upload key, or every existing user would be stranded.
+      - name: Prepare the Android signing key
+        id: signing
         env:
           KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          CHANNEL: ${{ inputs.channel }}
         run: |
-          if [ -z "$KEYSTORE" ] || [ -z "$STORE_PASS" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASS" ]; then
-            echo "::error::All four ANDROID_KEYSTORE_* secrets must be set on THIS repository. See PIPELINE.md."
+          set -euo pipefail
+          if [ -n "$KEYSTORE" ] && [ -n "$STORE_PASS" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASS" ]; then
+            echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/upload.jks"
+            echo "mode=upload" >> "$GITHUB_OUTPUT"
+            echo "suffix=" >> "$GITHUB_OUTPUT"
+            echo "Signing with the real upload key."
+          elif [ "$CHANNEL" = "release" ]; then
+            echo "::error::The release channel requires all four ANDROID_KEYSTORE_* secrets."
             exit 1
+          else
+            keytool -genkeypair -v -keystore "$RUNNER_TEMP/upload.jks" \
+              -storepass preview -keypass preview -alias preview \
+              -keyalg RSA -keysize 2048 -validity 365 \
+              -dname "CN=LinguPlay Preview, O=LinguPlay, C=DE"
+            echo "mode=preview" >> "$GITHUB_OUTPUT"
+            echo "suffix=-preview" >> "$GITHUB_OUTPUT"
+            echo "::warning::PREVIEW APK — throwaway key. Installable by sideload; a Play-signed build can never update it in place."
           fi
 
       - uses: ./.github/actions/setup-source
@@ -320,12 +371,11 @@ jobs:
         working-directory: source
         run: npm run android:sync-resources
 
-      - name: Decode keystore
-        env:
-          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/upload.jks"
-
+      # An AAB exists only to be uploaded to Play, which needs the real key.
+      # Building one with a throwaway key would waste several minutes producing
+      # a file nobody can use.
       - name: Build AAB (release)
+        if: steps.signing.outputs.mode == 'upload'
         working-directory: source
         env:
           NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
@@ -337,13 +387,15 @@ jobs:
           NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
         run: npm run tauri android build -- --apk --target aarch64
 
-      - name: Sign AAB and APK with the upload key
+      - name: Sign the Android output
         working-directory: source
         env:
-          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD || 'preview' }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD || 'preview' }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'preview' }}
           RELEASE_VERSION: ${{ inputs.version }}
+          MODE: ${{ steps.signing.outputs.mode }}
+          SUFFIX: ${{ steps.signing.outputs.suffix }}
         run: |
           set -euo pipefail
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
@@ -354,31 +406,35 @@ jobs:
           fi
           mkdir -p out
 
-          AAB=$(find "$GEN/bundle" -name '*-release.aab' | head -1)
-          if [ -z "$AAB" ]; then
-            echo "::error::Release AAB was not produced"
-            exit 1
+          if [ "$MODE" = "upload" ]; then
+            AAB=$(find "$GEN/bundle" -name '*-release.aab' | head -1)
+            if [ -z "$AAB" ]; then
+              echo "::error::Release AAB was not produced"
+              exit 1
+            fi
+            jarsigner -keystore "$RUNNER_TEMP/upload.jks" \
+              -storepass "$KS_PASS" -keypass "$KEY_PASS" \
+              -sigalg SHA256withRSA -digestalg SHA-256 \
+              "$AAB" "$KEY_ALIAS"
+            cp "$AAB" "out/LinguPlay_${RELEASE_VERSION}.aab"
           fi
-          jarsigner -keystore "$RUNNER_TEMP/upload.jks" \
-            -storepass "$KS_PASS" -keypass "$KEY_PASS" \
-            -sigalg SHA256withRSA -digestalg SHA-256 \
-            "$AAB" "$KEY_ALIAS"
-          cp "$AAB" "out/LinguPlay_${RELEASE_VERSION}.aab"
 
           UNSIGNED_APK=$(find "$GEN/apk" -name '*-release-unsigned.apk' | head -1)
           if [ -z "$UNSIGNED_APK" ]; then
             echo "::error::Unsigned release APK was not produced"
             exit 1
           fi
+          APK="out/LinguPlay_${RELEASE_VERSION}${SUFFIX}_arm64.apk"
           "$BT/zipalign" -f 4 "$UNSIGNED_APK" out/aligned.apk
           "$BT/apksigner" sign --ks "$RUNNER_TEMP/upload.jks" \
             --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" \
             --ks-key-alias "$KEY_ALIAS" \
-            --out "out/LinguPlay_${RELEASE_VERSION}_arm64.apk" out/aligned.apk
+            --out "$APK" out/aligned.apk
           rm -f out/aligned.apk
 
-          # Prove the APK really carries the upload key before anyone ships it.
-          "$BT/apksigner" verify --print-certs "out/LinguPlay_${RELEASE_VERSION}_arm64.apk" | head -5
+          # Prove the APK really carries a valid signature before anyone ships
+          # or sideloads it. An APK that fails this cannot be installed at all.
+          "$BT/apksigner" verify --print-certs "$APK" | head -5
           ls -lh out
 
       - uses: actions/upload-artifact@v4
@@ -456,6 +512,36 @@ jobs:
         working-directory: source
         run: npm run tauri ios build -- --target aarch64-sim --no-sign --ci
 
+      # This .app runs in Xcode's iOS Simulator on a Mac. It is NOT installable
+      # on a physical iPhone — that needs a paid Apple Developer account and a
+      # signing certificate. Kept as a workflow artifact rather than a release
+      # asset so nobody mistakes it for a download for users.
+      - name: Package the simulator app
+        working-directory: source
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          APP=$(find src-tauri/gen/apple -name '*.app' -type d -path '*Simulator*' -print -quit)
+          if [ -z "$APP" ]; then
+            APP=$(find src-tauri/gen/apple -name '*.app' -type d -print -quit)
+          fi
+          if [ -z "$APP" ]; then
+            echo "::error::No .app bundle was produced by the simulator build"
+            exit 1
+          fi
+          echo "Packaging $APP"
+          mkdir -p out
+          ditto -c -k --sequesterRsrc --keepParent "$APP" \
+            "out/LinguPlay_${RELEASE_VERSION}_iOS-Simulator.zip"
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-app
+          path: source/out/*
+          if-no-files-found: error
+
   # ------------------------------------------------------------ publish
   # One release, created only after every SHIPPING platform succeeded, and
   # published immediately rather than drafted-and-flipped so that the
@@ -477,28 +563,89 @@ jobs:
           ls -lh dist
           test -n "$(ls -A dist)" || { echo "::error::No artifacts to publish"; exit 1; }
 
+      # A preview must never become "latest": the website reads
+      # releases/latest, and a throwaway-signed Android build reaching real
+      # users is not recoverable — a Play-signed update cannot replace it.
+      - name: Work out the tag and channel
+        id: meta
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          VERSION: ${{ inputs.version }}
+          RUN: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANNEL" = "preview" ]; then
+            echo "tag=v${VERSION}-preview.${RUN}" >> "$GITHUB_OUTPUT"
+            echo "name=LinguPlay v${VERSION} (preview ${RUN})" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "name=LinguPlay v${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=${{ inputs.prerelease }}" >> "$GITHUB_OUTPUT"
+            echo "latest=${{ inputs.prerelease == false }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write the release notes
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [ "$CHANNEL" = "preview" ]; then
+            cat > notes.md <<EOF
+          ## ⚠️ Preview build — not for general use
+
+          The Android APK here is signed with a **throwaway key**. You can
+          sideload it to try the app, but a future Play Store build can never
+          update it in place — you would have to uninstall first.
+
+          The desktop builds are the same code a real release would ship.
+
+          **There is no iPhone build.** An installable \`.ipa\` needs a paid
+          Apple Developer account and a signing certificate. An iOS *simulator*
+          app (runs on a Mac under Xcode, not on a phone) is attached to the
+          workflow run as an artifact.
+
+          | Platform | File |
+          |---|---|
+          | macOS (Apple Silicon) | \`LinguPlay_native_arm64.dmg\` |
+          | Windows | \`.msi\` / \`-setup.exe\` |
+          | Linux | \`.deb\` / \`.AppImage\` |
+          | Android (sideload only) | \`LinguPlay_${VERSION}-preview_arm64.apk\` |
+          | Chrome / Edge extension | \`LinguPlay_Extension_${VERSION}.zip\` |
+
+          Built from private source \`${SOURCE_REF}\`.
+          EOF
+          else
+            cat > notes.md <<EOF
+          Official LinguPlay installers.
+
+          | Platform | Download |
+          |---|---|
+          | macOS (Apple Silicon) | \`LinguPlay_native_arm64.dmg\` |
+          | Windows | \`.msi\` / \`-setup.exe\` |
+          | Linux | \`.deb\` / \`.AppImage\` |
+          | Android | \`LinguPlay_${VERSION}_arm64.apk\` |
+          | Chrome / Edge extension | \`LinguPlay_Extension_${VERSION}.zip\` |
+
+          The macOS build is ad-hoc signed but not yet notarized by Apple, so
+          the first launch may need a Control-click and **Open**.
+
+          Built from private source \`${SOURCE_REF}\`.
+          EOF
+          fi
+          cat notes.md
+
       - name: Publish public release
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tag_name: v${{ inputs.version }}
-          name: LinguPlay v${{ inputs.version }}
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
           draft: false
-          prerelease: ${{ inputs.prerelease }}
-          make_latest: ${{ inputs.prerelease == false }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          make_latest: ${{ steps.meta.outputs.latest }}
           files: dist/*
-          body: |
-            Official LinguPlay installers.
-
-            | Platform | Download |
-            |---|---|
-            | macOS (Apple Silicon) | `LinguPlay_native_arm64.dmg` |
-            | Windows | `.msi` |
-            | Linux | `.deb` / `.AppImage` |
-            | Android | `LinguPlay_${{ inputs.version }}_arm64.apk` |
-            | Chrome / Edge extension | `LinguPlay_Extension_${{ inputs.version }}.zip` |
-
-            The macOS build is ad-hoc signed but not yet notarized by Apple, so
-            the first launch may need a Control-click and **Open**.
-
-            Built from private source `${{ inputs.source_ref }}`.
+          body_path: notes.md

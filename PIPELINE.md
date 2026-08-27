@@ -27,14 +27,43 @@ repository out into `./source` at build time using a **read-only deploy key**
 (`SOURCE_DEPLOY_KEY`), with `persist-credentials: false` so nothing downstream
 can reuse that key. Only the resulting installers are ever published.
 
+## Two channels
+
+The **Release** workflow has a `channel` input, and it is the difference
+between "let me see the app" and "ship this to users".
+
+| | `preview` | `release` |
+|---|---|---|
+| Needs the Android secrets | no | **yes** |
+| Android APK signed with | a throwaway key generated in the job | the real Play upload key |
+| Android AAB | not built | built and signed |
+| Tag | `v<version>-preview.<run>` | `v<version>` |
+| Becomes `releases/latest` | **never** | yes |
+| Safe to hand to users | **no** | yes |
+
+`preview` exists so the desktop, Android and extension builds can be produced
+and tried before the Play and Apple accounts are set up. It is always a
+prerelease, which is what keeps it out of `releases/latest` — and therefore out
+of the website's download buttons.
+
+### Why a preview APK is a one-way door
+
+There is no such thing as an installable unsigned APK: Android refuses to
+install one at all. So a preview APK is signed with a throwaway key generated
+during the build. It sideloads fine — and **a Play-signed build can never
+update it in place**. Anyone who installs a preview must uninstall it before
+they can take a real release. That is why previews never become `latest`, and
+why the filename carries `-preview`.
+
 ## Producing a release
 
 1. Open **Actions → Release** in this repository.
 2. **Run workflow**, and fill in:
    - `version` — semantic, **no leading `v`** (e.g. `0.3.0`)
    - `source_ref` — the branch, tag, or commit of the private source to build
-   - `prerelease` — leave unchecked for a normal release
-3. Wait. The run creates `v<version>` with every installer attached.
+   - `channel` — `preview` to try things out, `release` to ship
+   - `prerelease` — only meaningful on the `release` channel
+3. Wait. The run creates the tag with every installer attached.
 
 The workflow refuses to run if the release tag already exists. Bump the version
 instead of re-publishing: download URLs like `releases/latest/download/...` are
@@ -106,7 +135,13 @@ Rust/Swift/WebView integration still builds. It cannot produce an installable
 - secrets for both, plus an App Store Connect API key for TestFlight upload.
 
 Until those exist, **there is no iPhone installer to download**, and no amount
-of workflow editing will create one. When the account exists, add the signing
+of workflow editing will create one.
+
+What the job *does* produce is an iOS **simulator** app, attached to the
+workflow run as the `ios-simulator-app` artifact. It runs in Xcode's iOS
+Simulator on a Mac; it cannot be installed on a physical iPhone. It is kept as
+a run artifact rather than a release asset precisely so nobody mistakes it for
+a download for users. When the account exists, add the signing
 secrets and extend the `ios` job to build, sign, export an `.ipa`, and add `ios`
 to `publish`'s `needs`.
 
