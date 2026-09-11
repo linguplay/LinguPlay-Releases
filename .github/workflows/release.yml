@@ -417,11 +417,24 @@ jobs:
           NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
         run: npm run tauri android build -- --aab
 
-      - name: Build APK (release, arm64)
+      # Both ARM architectures, in ONE universal APK.
+      #
+      # arm64 alone looked safe — every current phone has 64-bit hardware. But
+      # some budget models ship a 32-BIT Android on it: the Galaxy A13
+      # (SM-A137F) is one, and it reports only armeabi-v7a. An APK carrying
+      # just arm64 libraries is refused outright there with
+      # INSTALL_FAILED_NO_MATCHING_ABIS, which reaches the user as the
+      # unhelpful "App not installed". Reported from a real phone.
+      #
+      # Universal rather than --split-per-abi: the website picks the Android
+      # download as the first asset ending in .apk, so a second APK would hand
+      # some people the wrong one at random. One file that works everywhere is
+      # worth the ~25 MB the second copy of the Rust library costs.
+      - name: Build APK (release, universal — arm64 + arm32)
         working-directory: source
         env:
           NDK_HOME: ${{ env.ANDROID_NDK_ROOT }}
-        run: npm run tauri android build -- --apk --target aarch64
+        run: npm run tauri android build -- --apk --target aarch64 armv7
 
       - name: Sign the Android output
         working-directory: source
@@ -460,7 +473,7 @@ jobs:
             echo "::error::Unsigned release APK was not produced"
             exit 1
           fi
-          APK="out/LinguPlay_${RELEASE_VERSION}${SUFFIX}_arm64.apk"
+          APK="out/LinguPlay_${RELEASE_VERSION}${SUFFIX}.apk"
           "$BT/zipalign" -f 4 "$UNSIGNED_APK" out/aligned.apk
           # v4 signing emits a separate .idsig that only `adb install
           # --incremental` consumes. Publishing it just puts a file nobody
@@ -474,6 +487,18 @@ jobs:
           # Prove the APK really carries a valid signature before anyone ships
           # or sideloads it. An APK that fails this cannot be installed at all.
           "$BT/apksigner" verify --print-certs "$APK" | head -5
+
+          # And prove it carries BOTH architectures. A universal APK that
+          # quietly lost its 32-bit half installs fine on the machines we test
+          # on and fails only on somebody's phone, which is how this was found
+          # the first time.
+          for ABI in arm64-v8a armeabi-v7a; do
+            if ! unzip -l "$APK" | grep -q "lib/$ABI/"; then
+              echo "::error::APK is missing $ABI native libraries"
+              exit 1
+            fi
+            echo "  carries $ABI"
+          done
           ls -lh out
 
       - uses: actions/upload-artifact@v4
@@ -652,7 +677,7 @@ jobs:
           | macOS (Apple Silicon) | \`LinguPlay_native_arm64.dmg\` |
           | Windows | \`.msi\` / \`-setup.exe\` |
           | Linux | \`.deb\` / \`.AppImage\` |
-          | Android (sideload only) | \`LinguPlay_${VERSION}-preview_arm64.apk\` |
+          | Android (sideload only) | \`LinguPlay_${VERSION}-preview.apk\` |
           | Chrome / Edge extension | \`LinguPlay_Extension_${VERSION}.zip\` |
 
           Built from private source \`${SOURCE_REF}\`.
@@ -666,7 +691,7 @@ jobs:
           | macOS (Apple Silicon) | \`LinguPlay_native_arm64.dmg\` |
           | Windows | \`.msi\` / \`-setup.exe\` |
           | Linux | \`.deb\` / \`.AppImage\` |
-          | Android | \`LinguPlay_${VERSION}_arm64.apk\` |
+          | Android | \`LinguPlay_${VERSION}.apk\` |
           | Chrome / Edge extension | \`LinguPlay_Extension_${VERSION}.zip\` |
 
           The macOS build is ad-hoc signed but not yet notarized by Apple, so
