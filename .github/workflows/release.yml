@@ -414,22 +414,15 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
-          # The action's own licence acceptance exits 1, and takes the build
-          # with it, because sdkmanager still asks the SDK repository for the
-          # obsolete `tools` package which is no longer served:
+          # The action installs `tools platform-tools` by default, and `tools`
+          # is obsolete — Google no longer serves it, so sdkmanager exits 1 and
+          # takes the release with it:
+          #     [command] .../sdkmanager tools
           #     Warning: Failed to find package 'tools'
-          #     Error: The process '.../sdkmanager' failed with exit code 1
-          # v3 and v4 fail identically, so this is the repository changing
-          # under us rather than the action. Licences are accepted in the step
-          # below instead, where one missing obsolete package cannot fail a
-          # release.
-          accept-android-sdk-licenses: false
-
-      # Not `|| true` out of indifference: the NDK install immediately after is
-      # the real proof the licences were accepted, and it fails loudly if they
-      # were not. This step only has to stop one dead package ending a release.
-      - name: Accept Android SDK licences
-        run: yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          # Nothing here changed; the SDK repository did, which is why Android
+          # passed on 0.3.55 and failed every run three days later. The NDK
+          # step below installs what is actually needed.
+          packages: platform-tools
 
       - name: Install NDK
         run: sdkmanager "ndk;26.1.10909125" "platform-tools"
