@@ -407,8 +407,12 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      # v3 targets Node 20, which GitHub now forces onto Node 24, and the
+      # step started failing on 2026-09-17 having worked three days earlier.
+      # Nothing in the app changed; the runner did. v4 targets Node 24.
+      # See: github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install NDK
         run: sdkmanager "ndk;26.1.10909125" "platform-tools"
