@@ -235,7 +235,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
-            librsvg2-dev patchelf libvlc-dev
+            librsvg2-dev patchelf libvlc-dev \
+            vlc-plugin-base vlc-plugin-video-output
 
       - uses: ./.github/actions/setup-source
         with:
@@ -273,6 +274,37 @@ jobs:
           cp "vlc-${VLC_VERSION}/libvlccore.dll" src-tauri/vlc/
           cp -r "vlc-${VLC_VERSION}/plugins" src-tauri/vlc/
           rm -rf "${VLC_ARCHIVE}" "vlc-${VLC_VERSION}"
+
+      # The AppImage has to carry VLC's plugins, and only the plugins.
+      # libvlc.so.5 and libvlccore.so.9 are LOAD-TIME imports, so the AppImage
+      # tooling copies them in along with every other linked library. The
+      # plugins are dlopen'd at runtime, which makes them invisible to that
+      # tooling — and a libVLC with no plugins opens every file and decodes
+      # none of them, which looks far more like a broken app than a missing
+      # dependency. The .deb does not rely on this copy: it declares the VLC
+      # packages, and the runtime prefers the system's plugins when they exist.
+      - name: Bundle libVLC plugins (Linux only)
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          PLUGINS=""
+          for dir in /usr/lib/x86_64-linux-gnu/vlc/plugins /usr/lib/vlc/plugins; do
+            if [ -d "$dir" ]; then PLUGINS="$dir"; break; fi
+          done
+          if [ -z "$PLUGINS" ]; then
+            echo "::error::No VLC plugin directory found; the AppImage would decode nothing."
+            exit 1
+          fi
+          mkdir -p src-tauri/vlc
+          cp -r "$PLUGINS" src-tauri/vlc/
+          # Proved, not assumed: an empty plugin directory is precisely the
+          # silent failure this step exists to prevent, and it would otherwise
+          # only surface as "the file will not play" on somebody else's machine.
+          count=$(find src-tauri/vlc/plugins -name '*.so' | wc -l)
+          echo "bundled $count libVLC plugins from $PLUGINS"
+          test "$count" -gt 50
 
       - name: Build app
         uses: tauri-apps/tauri-action@v0
