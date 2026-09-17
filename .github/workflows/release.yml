@@ -299,12 +299,54 @@ jobs:
           fi
           mkdir -p src-tauri/vlc
           cp -r "$PLUGINS" src-tauri/vlc/
-          # Proved, not assumed: an empty plugin directory is precisely the
-          # silent failure this step exists to prevent, and it would otherwise
-          # only surface as "the file will not play" on somebody else's machine.
+          before=$(du -sm src-tauri/vlc/plugins | cut -f1)
+
+          # Carrying every plugin took the AppImage to 127 MB, which took ~22
+          # minutes to upload and tripped the release step's header timeout.
+          #
+          # A DENY list, not an allow list, and deliberately so: a category
+          # nobody here has heard of is kept, because the cost of keeping
+          # something unnecessary is a few megabytes and the cost of dropping
+          # something load-bearing is Linux playback failing silently on
+          # somebody else's machine. These are the ones a player that only
+          # opens local files into its own window never loads -- VLC's own Qt
+          # interface, its scripting, network discovery, and everything to do
+          # with streaming OUT rather than playing in.
+          for unused in gui lua services_discovery stream_out mux \
+                        access_output visualization control; do
+            rm -rf "src-tauri/vlc/plugins/$unused"
+          done
+
+          after=$(du -sm src-tauri/vlc/plugins | cut -f1)
           count=$(find src-tauri/vlc/plugins -name '*.so' | wc -l)
-          echo "bundled $count libVLC plugins from $PLUGINS"
+          echo "libVLC plugins: ${before} MB -> ${after} MB (${count} kept) from $PLUGINS"
           test "$count" -gt 50
+
+      # Counting plugins proves nothing about whether they work: a set can be
+      # the right size and still be missing the one demuxer that matters. This
+      # opens a real video through the trimmed set and checks it decodes, so a
+      # bad trim fails the build here rather than a user's evening months from
+      # now. Runs BEFORE the build, because failing in seconds beats failing
+      # after fifteen minutes.
+      - name: Prove the trimmed plugin set still plays video (Linux only)
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        working-directory: source
+        run: |
+          set -euo pipefail
+          ffmpeg -y -v error -f lavfi -i testsrc=size=320x240:rate=15:duration=4 \
+                 -f lavfi -i sine=frequency=440:duration=4 \
+                 -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+                 -c:a aac -shortest /tmp/vlc-probe.mkv
+          LIBVLC=$(ls /usr/lib/x86_64-linux-gnu/libvlc.so.5* 2>/dev/null | head -1)
+          if [ -z "$LIBVLC" ]; then
+            echo "::error::libvlc.so.5 not found; cannot verify the trim."
+            exit 1
+          fi
+          python3 scripts/verify-vlc-plugins.py \
+            --libvlc "$LIBVLC" \
+            --plugins "$PWD/src-tauri/vlc/plugins" \
+            --media /tmp/vlc-probe.mkv
 
       - name: Build app
         uses: tauri-apps/tauri-action@v0
