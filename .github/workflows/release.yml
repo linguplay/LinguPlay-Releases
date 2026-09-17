@@ -401,8 +401,14 @@ jobs:
           version: ${{ inputs.version }}
           deploy-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
 
+      # v4 targets Node 20, which GitHub is retiring and already forces onto
+      # Node 24. v5 and v6 both target Node 24; v6 is the maintained line, and
+      # its two breaking changes miss us: it removes the legacy Adopt
+      # distributions, and we ask for temurin, while the ESM migration is
+      # documented as not user-facing. Bumped before it breaks rather than
+      # after, which is how setup-android was handled and cost four builds.
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: 17
