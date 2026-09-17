@@ -358,35 +358,6 @@ jobs:
         with:
           projectPath: source
 
-      # Does squashfs already store identical files once?
-      #
-      # The AppDir carries librsvg three times as three real copies -- the
-      # AppImage tooling dereferences symlinks. That looks like 20 MB to
-      # reclaim, but only if the filesystem underneath is storing all three.
-      # mksquashfs has a -no-duplicates flag, which implies detection is on by
-      # default, and acting on "implies" is what made the plugin trim save two
-      # megabytes of a hundred and twenty-seven.
-      #
-      # So: three identical 20 MB files of RANDOM data -- incompressible, so
-      # the size is about storage and not about gzip. ~20 MB means duplicates
-      # are already free and there is nothing here to win. ~60 MB means there
-      # is.
-      - name: Measure whether duplicate files cost anything (Linux only)
-        if: matrix.platform == 'ubuntu-22.04'
-        shell: bash
-        run: |
-          set -uo pipefail
-          command -v mksquashfs >/dev/null 2>&1 || sudo apt-get install -y -qq squashfs-tools
-          rm -rf /tmp/dupprobe && mkdir -p /tmp/dupprobe
-          head -c 20000000 /dev/urandom > /tmp/dupprobe/a.bin
-          cp /tmp/dupprobe/a.bin /tmp/dupprobe/b.bin
-          cp /tmp/dupprobe/a.bin /tmp/dupprobe/c.bin
-          echo "input: 3 x 20 MB identical incompressible files = 60 MB"
-          mksquashfs /tmp/dupprobe /tmp/dupprobe.sqfs -noappend -quiet
-          echo "squashfs result: $(du -m /tmp/dupprobe.sqfs | cut -f1) MB"
-          echo "  ~20 MB => duplicates already cost nothing; leave them alone"
-          echo "  ~60 MB => deduplicating the AppDir is worth doing"
-
       # The plugin trim saved 2 MB of 127, so the weight is somewhere else and
       # guessing at it has already cost one build. Report it instead.
       - name: Report what the AppImage is made of (Linux only)
