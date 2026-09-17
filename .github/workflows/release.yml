@@ -821,7 +821,14 @@ jobs:
           fi
           cat notes.md
 
+      # Allowed to fail on purpose. Nine artifacts go up in parallel and one
+      # fails at random with a bare "Error uploading" and no name attached --
+      # the 126 MB AppImage arriving intact while a 17 MB .deb did not, so it
+      # is not about size. This action has no retry and no concurrency control
+      # (its inputs are body/files/draft/prerelease/make_latest and little
+      # else), so the retry lives in the step below, which is the real gate.
       - name: Publish public release
+        continue-on-error: true
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -832,3 +839,64 @@ jobs:
           make_latest: ${{ steps.meta.outputs.latest }}
           files: dist/*
           body_path: notes.md
+
+      # Finish what the upload started.
+      #
+      # Additive: when everything went up, this finds nothing missing and does
+      # nothing. When it did not, it re-uploads only what is absent and then
+      # decides the job -- a release is finished when every artifact is on it,
+      # not when the uploader felt it had tried.
+      #
+      # It also clears the draft flag. A partial upload leaves the release a
+      # DRAFT, which is how 0.3.57 came to need finishing by hand: every job
+      # green, nothing visible to anybody.
+      - name: Make sure every artifact really got there
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$TAG does not exist; the upload failed before creating it."
+            exit 1
+          fi
+
+          for attempt in 1 2 3 4 5; do
+            present=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                        --json assets -q '.assets[].name' 2>/dev/null || true)
+            todo=0
+            for f in dist/*; do
+              name=$(basename "$f")
+              printf '%s\n' "$present" | grep -Fxq "$name" && continue
+              todo=$((todo + 1))
+              echo "attempt $attempt: $name is missing, uploading"
+              gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY" --clobber || true
+            done
+            [ "$todo" -eq 0 ] && break
+            sleep $((attempt * 10))
+          done
+
+          # The verification, separate from the retries, so a silent upload
+          # failure cannot be mistaken for success.
+          present=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                      --json assets -q '.assets[].name' 2>/dev/null || true)
+          fail=0
+          for f in dist/*; do
+            name=$(basename "$f")
+            if printf '%s\n' "$present" | grep -Fxq "$name"; then
+              echo "  ok: $name"
+            else
+              echo "::error::$name never uploaded after five attempts"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+
+          if [ "${{ steps.meta.outputs.latest }}" = "true" ]; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          else
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          fi
+          echo "$TAG is published with every artifact present"
