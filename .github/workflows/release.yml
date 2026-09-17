@@ -334,10 +334,13 @@ jobs:
         working-directory: source
         run: |
           set -euo pipefail
-          ffmpeg -y -v error -f lavfi -i testsrc=size=320x240:rate=15:duration=4 \
-                 -f lavfi -i sine=frequency=440:duration=4 \
-                 -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
-                 -c:a aac -shortest /tmp/vlc-probe.mkv
+          # A fixture in the repo, not ffmpeg: these runners do not have it,
+          # and generating the probe here cost a whole build to discover that.
+          PROBE="samples/vlc-probe.mkv"
+          if [ ! -f "$PROBE" ]; then
+            echo "::error::$PROBE is missing; the trim cannot be verified."
+            exit 1
+          fi
           LIBVLC=$(ls /usr/lib/x86_64-linux-gnu/libvlc.so.5* 2>/dev/null | head -1)
           if [ -z "$LIBVLC" ]; then
             echo "::error::libvlc.so.5 not found; cannot verify the trim."
@@ -346,7 +349,7 @@ jobs:
           python3 scripts/verify-vlc-plugins.py \
             --libvlc "$LIBVLC" \
             --plugins "$PWD/src-tauri/vlc/plugins" \
-            --media /tmp/vlc-probe.mkv
+            --media "$PWD/$PROBE"
 
       - name: Build app
         uses: tauri-apps/tauri-action@v0
@@ -354,6 +357,28 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: source
+
+      # The plugin trim saved 2 MB of 127, so the weight is somewhere else and
+      # guessing at it has already cost one build. Report it instead.
+      - name: Report what the AppImage is made of (Linux only)
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        working-directory: source
+        run: |
+          set -uo pipefail
+          APPDIR=$(find src-tauri/target -maxdepth 5 -type d -name '*.AppDir' | head -1)
+          if [ -z "$APPDIR" ]; then
+            echo "no AppDir found; skipping the report"
+            exit 0
+          fi
+          echo "total: $(du -sm "$APPDIR" | cut -f1) MB"
+          echo "--- largest directories ---"
+          du -sm "$APPDIR"/usr/* "$APPDIR"/usr/lib/* 2>/dev/null | sort -rn > /tmp/dirs.txt || true
+          head -15 /tmp/dirs.txt
+          echo "--- largest single files ---"
+          find "$APPDIR" -type f -size +2M -printf '%s\t%p\n' 2>/dev/null \
+            | sort -rn | awk '{printf "%d MB\t%s\n", $1/1048576, $2}' > /tmp/files.txt || true
+          head -15 /tmp/files.txt
 
       # libvlc.dll is a LOAD-TIME import (raw-dylib), so Windows must find it
       # in the executable's own directory — it never searches subfolders.
